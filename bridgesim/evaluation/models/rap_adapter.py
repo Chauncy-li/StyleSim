@@ -1,0 +1,431 @@
+"""
+Model adapter for RAP (Rasterized Autonomous Planner).
+Supports rasterized_3d, and MetaDrive camera modes.
+"""
+
+import os
+import sys
+import torch
+import numpy as np
+import cv2
+from pathlib import Path
+from typing import Dict, Any
+
+# Monkey patch for PyTorch-transformers compatibility
+# Fix: transformers expects register_pytree_node but PyTorch 2.0.x/2.1.0 has _register_pytree_node
+if not hasattr(torch.utils._pytree, "register_pytree_node"):
+    _original_register = torch.utils._pytree._register_pytree_node
+
+    def _register_pytree_node_wrapper(cls, flatten_fn, unflatten_fn, *, serialized_type_name=None):
+        return _original_register(cls, flatten_fn, unflatten_fn)
+
+    torch.utils._pytree.register_pytree_node = _register_pytree_node_wrapper
+
+# RAP Imports from modelzoo
+from bridgesim.modelzoo.navsim.agents.rap_dino.rap_model import RAPModel
+from bridgesim.modelzoo.navsim.agents.rap_dino.navsim_config import RAPConfig
+
+# Import camera params and renderer from converters
+metabench_root = Path(__file__).resolve().parent.parent.parent.parent
+converters_bench2drive_path = metabench_root / "converters" / "bench2drive"
+sys.path.insert(0, str(converters_bench2drive_path))
+from renderer import camera_params, convert_camera_params_to_simple_format, ScenarioRenderer
+
+from bridgesim.evaluation.models.base_adapter import BaseModelAdapter
+from bridgesim.evaluation.utils.constants import NAVSIM_CMD_MAPPING, DEFAULT_CMD
+
+
+# RAP Model expects images in this order
+CAM_ORDER = ['CAM_B0', 'CAM_F0', 'CAM_L0', 'CAM_R0']
+
+# Image Normalization Constants (RGB)
+IMG_MEAN = torch.tensor([123.675, 116.28, 103.53], dtype=torch.float32).view(1, 3, 1, 1)
+IMG_STD = torch.tensor([58.395, 57.12, 57.375], dtype=torch.float32).view(1, 3, 1, 1)
+IMG_SCALE = 0.4
+
+# Camera names for MetaDrive
+CAM_NAMES = ['CAM_F0', 'CAM_L0', 'CAM_R0', 'CAM_B0']
+
+
+class RAPAdapter(BaseModelAdapter):
+    """
+    Adapter for RAP model.
+
+    RAP supports three image sources:
+    - 'rasterized': Uses pre-rendered BEV images (placeholder, no live cameras)
+    - 'metadrive': Uses MetaDrive camera sensors (4 cameras)
+    - 'rasterized_3d': Uses ScenarioRenderer to render nuPlan-style camera views
+                       from the live MetaDrive environment state
+    """
+
+    def __init__(self, checkpoint_path: str, image_source: str = "metadrive",
+                 scorer=None, num_proposals: int = None, **kwargs):
+        """
+        Initialize RAP adapter.
+
+        Args:
+            checkpoint_path: Path to checkpoint (.ckpt file)
+            image_source: 'rasterized', 'metadrive', or 'rasterized_3d'
+            scorer: Optional BaseTrajectoryScorer instance for candidate selection.
+                    When set, returns all proposals for external scoring.
+            num_proposals: If set, truncate candidates to the first num_proposals
+                           before passing to the scorer.
+        """
+        super().__init__(checkpoint_path, config_path=None, **kwargs)
+        self.image_source = image_source
+        self.scorer = scorer
+        self.num_proposals = num_proposals
+        self._current_frame_id = 0
+        self.config = None
+        self.lidar2img_tensor = None
+        self.img_shape_tensor = None
+        self.renderer = None
+
+    def load_model(self):
+        """Load RAP model."""
+        print(f"Loading RAP model (image_source={self.image_source})...")
+
+        # Initialize RAP config
+        self.config = RAPConfig()
+        self.config.b2d = False
+        self.config.num_poses = 10
+        self.config.trajectory_sampling.num_poses = 10
+        self.config.trajectory_sampling.time_horizon = 5.0
+
+        # Initialize model
+        self.model = RAPModel(self.config).to(self.device)
+        self.model.progress = 0.0
+        self.model.batch_size = 1
+
+        # Load checkpoint
+        print(f"Loading checkpoint: {self.checkpoint_path}")
+        ckpt = torch.load(self.checkpoint_path, map_location='cpu')
+        state_dict = ckpt.get('state_dict', ckpt)
+
+        # Strip prefixes if trained with Lightning/DDP
+        clean_sd = {k.replace('agent._rap_model.', '').replace('_rap_model.', ''): v
+                   for k, v in state_dict.items()}
+        self.model.load_state_dict(clean_sd, strict=False)
+        self.model.eval()
+
+        # Precompute calibration features
+        self._setup_calibration_features()
+
+        # Initialize ScenarioRenderer for rasterized_3d mode
+        if self.image_source == "rasterized_3d":
+            self.renderer = ScenarioRenderer(camera_channel_list=CAM_ORDER)
+            print("ScenarioRenderer initialized for rasterized_3d mode.")
+
+        print("RAP model loaded successfully.")
+
+    def _setup_calibration_features(self):
+        """Precompute lidar2img matrices and image shapes."""
+        lidar2imgs = []
+        img_shapes = []
+
+        # Scale Matrix (0.4x resizing)
+        S = np.eye(4, dtype=np.float32)
+        S[0, 0] = IMG_SCALE
+        S[1, 1] = IMG_SCALE
+
+        for cam_name in CAM_ORDER:
+            params = camera_params[cam_name]
+
+            # 1. Construct Sensor2Lidar (Extrinsics)
+            s2l = np.eye(4, dtype=np.float32)
+            s2l[:3, :3] = params['sensor2lidar_rotation']
+            s2l[:3, 3] = params['sensor2lidar_translation']
+
+            # 2. Get Lidar2Sensor (Inverse)
+            l2s = np.linalg.inv(s2l)
+
+            # 3. Construct Intrinsics (4x4)
+            K = np.eye(4, dtype=np.float32)
+            K[:3, :3] = params['intrinsics']
+
+            # 4. Compute Lidar2Img: S * K * L2S
+            l2i = S @ K @ l2s
+            lidar2imgs.append(l2i)
+
+            # 5. Image Shape (H, W, 3) after scaling
+            h = int(1120 * IMG_SCALE)  # 448
+            w = int(1920 * IMG_SCALE)  # 768
+            img_shapes.append((h, w, 3))
+
+        # Convert to tensors
+        self.lidar2img_tensor = torch.from_numpy(np.stack(lidar2imgs)).float().unsqueeze(0).to(self.device)
+        self.img_shape_tensor = torch.from_numpy(np.stack(img_shapes)).float().unsqueeze(0).to(self.device)
+
+    def get_camera_configs(self) -> Dict[str, Dict[str, float]]:
+        """RAP uses 4 cameras when using MetaDrive mode."""
+        if self.image_source == "metadrive":
+            # Convert camera params to MetaDrive format
+            cam_configs = convert_camera_params_to_simple_format(
+                camera_params,
+                image_width=1920,
+                image_height=1120,
+                to_metadrive=True
+            )
+            return cam_configs
+        else:
+            # rasterized and rasterized_3d modes handle perception themselves
+            return {}
+
+    def perceive(self, env, frame_id: int):
+        """
+        Custom perception for rasterized_3d mode: builds a scenario dict from
+        the live MetaDrive env state and renders camera views via ScenarioRenderer.
+        Returns None for other modes so the base evaluator handles perception.
+        """
+        if self.image_source != "rasterized_3d":
+            return None
+
+        scenario = self._build_raster_scenario_dict(env, frame_id)
+        imgs = self.renderer.observe(scenario)
+        return imgs
+
+    def _build_raster_scenario_dict(self, env, frame_id: int) -> Dict[str, Any]:
+        """
+        Build the scenario dict required by ScenarioRenderer from the current
+        MetaDrive environment state (mirrors _build_raster_scenario_dict in the
+        reference offline evaluator script).
+        """
+        # Import here to avoid hard dependency when mode is not rasterized_3d
+        from metadrive.type import MetaDriveType
+
+        ego_vehicle = env.agent
+        scenario = {
+            'ego_pos_3d': np.array(ego_vehicle.get_state()["position"]),
+            'ego_heading': ego_vehicle.heading_theta,
+            'map_features': env.engine.data_manager.current_scenario["map_features"],
+            'traffic_lights': []
+        }
+
+        # Traffic light states
+        dynamic_map = env.engine.data_manager.current_scenario.get("dynamic_map_states", {})
+        for lane_id, tl_data in dynamic_map.items():
+            if "state" in tl_data and frame_id < len(tl_data["state"]["object_state"]):
+                state_str = tl_data["state"]["object_state"][frame_id]
+                is_red = (state_str == "LANE_STATE_STOP")
+                pos_xy = tl_data["stop_point"][:2]
+                scenario['traffic_lights'].append((lane_id, is_red, pos_xy))
+
+        # Dynamic objects (vehicles, pedestrians, cyclists)
+        gt_boxes_world = []
+        gt_names = []
+        objects = env.engine.get_objects(filter=lambda o: o.name != ego_vehicle.name)
+        for obj in objects.values():
+            if obj.metadrive_type == MetaDriveType.TRAFFIC_LIGHT:
+                continue
+            obj_state = obj.get_state()
+            box_data = [
+                obj_state["position"][0], obj_state["position"][1], obj_state["position"][2],
+                obj.LENGTH, obj.WIDTH, obj.HEIGHT,
+                obj.heading_theta
+            ]
+            gt_boxes_world.append(box_data)
+            if obj.metadrive_type == MetaDriveType.VEHICLE:
+                gt_names.append("vehicle")
+            elif obj.metadrive_type == MetaDriveType.PEDESTRIAN:
+                gt_names.append("pedestrian")
+            elif obj.metadrive_type == MetaDriveType.CYCLIST:
+                gt_names.append("bicycle")
+            else:
+                gt_names.append("vehicle")
+
+        if gt_boxes_world:
+            scenario['anns'] = {
+                'gt_boxes_world': np.array(gt_boxes_world, dtype=np.float32),
+                'gt_names': np.array(gt_names)
+            }
+        else:
+            scenario['anns'] = {
+                'gt_boxes_world': np.empty((0, 7), dtype=np.float32),
+                'gt_names': np.empty((0,), dtype=str)
+            }
+
+        return scenario
+
+    def _preprocess_images(self, images_dict: Dict[str, np.ndarray]) -> torch.Tensor:
+        """
+        Preprocess images for RAP model.
+        Scale -> Normalize -> Pad
+        """
+        processed_imgs = []
+
+        for cam_name in CAM_ORDER:
+            # Map from CAM_NAMES to CAM_ORDER naming
+            md_name = cam_name.replace('_B0', '_BACK').replace('_F0', '_FRONT').replace('_L0', '_FRONT_LEFT').replace('_R0', '_FRONT_RIGHT')
+            if 'BACK' in md_name:
+                md_name = 'CAM_B0'
+            elif md_name == 'CAM_FRONT':
+                md_name = 'CAM_F0'
+            elif 'LEFT' in md_name:
+                md_name = 'CAM_L0'
+            elif 'RIGHT' in md_name:
+                md_name = 'CAM_R0'
+
+            img = images_dict[md_name]
+
+            # 1. RandomScale(0.4)
+            h, w = img.shape[:2]
+            new_h, new_w = int(h * IMG_SCALE), int(w * IMG_SCALE)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            # 2. Transpose (H, W, C) -> (C, H, W)
+            img = img.transpose(2, 0, 1)
+            processed_imgs.append(img)
+
+        # Stack cameras: (4, 3, H, W)
+        img_tensor = torch.from_numpy(np.stack(processed_imgs)).float()
+
+        # 3. Normalize (using RGB means)
+        img_tensor = (img_tensor - IMG_MEAN.to(img_tensor.device)) / IMG_STD.to(img_tensor.device)
+
+        # 4. PadMultiViewImage (Divisor 32)
+        _, _, h, w = img_tensor.shape
+        pad_h = int(np.ceil(h / 32)) * 32
+        pad_w = int(np.ceil(w / 32)) * 32
+
+        if pad_h != h or pad_w != w:
+            padding = torch.nn.ZeroPad2d((0, pad_w - w, 0, pad_h - h))
+            img_tensor = padding(img_tensor)
+
+        return img_tensor
+
+    def _get_ego_status(self, velocity: np.ndarray, acceleration: np.ndarray, command: np.ndarray) -> torch.Tensor:
+        """
+        Constructs ego_status tensor [11].
+        Format: [pose(3), vel(2), acc(2), command(4)]
+
+        RAP model uses local frame where current pose is [0, 0, 0].
+        """
+        pose = torch.zeros(3, dtype=torch.float32)
+        vel = torch.tensor(velocity, dtype=torch.float32)
+        acc = torch.tensor(acceleration, dtype=torch.float32)
+        cmd = torch.tensor(command, dtype=torch.float32)
+
+        return torch.cat([pose, vel, acc, cmd], dim=0)
+
+    def prepare_input(self,
+                     images: Dict[str, np.ndarray],
+                     ego_state: Dict[str, Any],
+                     scenario_data: Dict[str, Any],
+                     frame_id: int) -> Any:
+        """Prepare input for RAP model."""
+        self._current_frame_id = frame_id
+
+        # 1. Preprocess images
+        img_tensor = self._preprocess_images(images).unsqueeze(0).to(self.device)
+
+        # 2. Compute velocity and acceleration in local frame
+        velocity = ego_state['velocity']
+        heading = ego_state['heading']
+
+        # Rotation Matrix Global -> Ego
+        c, s = np.cos(heading), np.sin(heading)
+        R = np.array([[c, s], [-s, c]])
+
+        vel_local = R @ velocity[:2]
+
+        # Compute acceleration (if previous velocity is available, use finite difference)
+        if hasattr(self, '_prev_velocity'):
+            acc_global = (velocity[:2] - self._prev_velocity[:2]) / 0.1  # 10Hz
+            acc_local = R @ acc_global
+        else:
+            acc_local = np.array([0.0, 0.0])
+        self._prev_velocity = velocity
+
+        # 3. Get command
+        command = ego_state['command']
+        cmd_vec = NAVSIM_CMD_MAPPING.get(command, DEFAULT_CMD)
+
+        # 4. Prepare ego status
+        curr_status = self._get_ego_status(vel_local, acc_local, cmd_vec)
+        # Stack 4 times to mimic history
+        ego_status_tensor = torch.stack([curr_status] * 4).unsqueeze(0).to(self.device)
+
+        # 5. Build inputs
+        inputs = {
+            "camera_feature": img_tensor,
+            "ego_status": ego_status_tensor,
+            "camera_valid": torch.tensor([True]).to(self.device),
+            "lidar2img": self.lidar2img_tensor,
+            "img_shape": self.img_shape_tensor
+        }
+
+        return inputs
+
+    def run_inference(self, model_input: Any) -> Any:
+        """Run RAP model inference."""
+        with torch.no_grad():
+            if self.scorer is not None:
+                output = self.model(model_input, targets=None, return_score=True)
+                # Truncate to first num_proposals candidates
+                if self.num_proposals is not None:
+                    k = self.num_proposals
+                    total = output["trajectory"].shape[1]
+                    output["trajectory"] = output["trajectory"][:, :k]
+                    output["score"] = output["score"][:, :k]
+                    print(f"[RAP] Truncated proposals: {total} -> {k}")
+            elif self.num_proposals is not None:
+                # No scorer but num_proposals set: get all proposals, truncate,
+                # then use model's own scores to select best from truncated set
+                output = self.model(model_input, targets=None, return_score=True)
+                k = self.num_proposals
+                total = output["trajectory"].shape[1]
+                proposals = output["trajectory"][:, :k]  # (B, k, T, 3)
+                scores = output["score"][:, :k]  # (B, k)
+                best_idx = torch.argmax(scores, dim=1)  # (B,)
+                batch_size = proposals.shape[0]
+                output["trajectory"] = proposals[torch.arange(batch_size), best_idx]  # (B, T, 3)
+                print(f"[RAP] Truncated proposals (no scorer): {total} -> {k}")
+            else:
+                output = self.model(model_input, targets=None)
+        return output
+
+    def parse_output(self, model_output: Any, ego_state: Dict[str, Any]) -> Dict[str, np.ndarray]:
+        """Parse RAP output."""
+        if self.scorer is not None:
+            # return_score=True: trajectory is all proposals (B, 64, T, 3)
+            # Wrap as all_candidates for scorer
+            all_proposals = model_output["trajectory"]  # (B, 64, T, 3)
+            scorer_input = {"all_candidates": all_proposals}
+            result = self.scorer.select_best(
+                scorer_input,
+                ego_state=ego_state,
+                frame_idx=self._current_frame_id,
+            )
+            trajectory = result["trajectory"][0].cpu().numpy()  # (T, 3)
+            traj_swapped = np.column_stack([trajectory[:, 1], trajectory[:, 0]])
+            parsed = {
+                'trajectory': traj_swapped,
+                'best_idx': result["best_idx"][0].item(),
+                'num_candidates': all_proposals.shape[1],
+            }
+
+            # Include all candidates and scores for visualization
+            all_cands = all_proposals[0].cpu().numpy()  # (64, T, 3)
+            cands_swapped = np.stack([
+                np.column_stack([c[:, 1], c[:, 0]]) for c in all_cands
+            ])
+            parsed['trajectory_coarse'] = cands_swapped
+            parsed['coarse_scores'] = result["scores"][0].cpu().numpy()
+
+            return parsed
+
+        # Default: single trajectory from argmax selection
+        pred_traj_full = model_output["trajectory"][0].cpu().numpy()
+
+        # RAP outputs [forward, lateral, heading]
+        # Swap columns: [forward, lateral] -> [lateral, forward]
+        if pred_traj_full.ndim == 2 and pred_traj_full.shape[1] >= 2:
+            pred_traj_local = np.column_stack([pred_traj_full[:, 1], pred_traj_full[:, 0]])
+        else:
+            pred_traj_local = pred_traj_full
+
+        return {'trajectory': pred_traj_local}
+
+    def get_trajectory_time_horizon(self) -> float:
+        """RAP predicts trajectory with 5.0s horizon (10 poses at 0.5s intervals)."""
+        return 5.0
