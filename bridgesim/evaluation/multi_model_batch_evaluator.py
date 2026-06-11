@@ -246,6 +246,7 @@ def main():
     requested_models = _resolve_requested_models(args)
     total_scenarios = _effective_scenario_count(scenario_root, args.scenario_limit)
     comparison_rows: List[Dict] = []
+    total_models = len(requested_models)
 
     manifest = {
         "scenario_root": str(scenario_root),
@@ -263,7 +264,7 @@ def main():
         "scenario_limit": args.scenario_limit,
     }
 
-    for model_name in requested_models:
+    for model_idx, model_name in enumerate(requested_models, start=1):
         spec = _build_model_spec(model_name)
         model_output_dir = output_root / spec["cli_model_type"]
         missing = _check_required_paths(spec)
@@ -280,17 +281,33 @@ def main():
         }
 
         if missing:
+            print(
+                f"[multi-model] [{model_idx}/{total_models}] Skipping {spec['cli_model_type']} "
+                f"because required files are missing: {'; '.join(missing)}",
+                flush=True,
+            )
             row["status"] = "skipped"
             row["error"] = "; ".join(missing)
             comparison_rows.append(row)
             continue
 
         if args.dry_run:
+            print(
+                f"[multi-model] [{model_idx}/{total_models}] Dry run: would evaluate "
+                f"{spec['cli_model_type']} on {total_scenarios} scenarios",
+                flush=True,
+            )
             row["status"] = "dry_run"
             comparison_rows.append(row)
             continue
 
         start_time = time.time()
+        print(
+            f"[multi-model] [{model_idx}/{total_models}] Starting {spec['cli_model_type']} "
+            f"on {total_scenarios} scenarios",
+            flush=True,
+        )
+        print(f"[multi-model] Output dir: {model_output_dir}", flush=True)
         try:
             evaluator = BatchEvaluator(
                 model_type=spec["cli_model_type"],
@@ -329,13 +346,29 @@ def main():
                 row["status"] = "success"
                 for metric in SUMMARY_COLUMNS:
                     row[metric] = average_row.get(metric, "")
+                print(
+                    f"[multi-model] [{model_idx}/{total_models}] Finished {spec['cli_model_type']} "
+                    f"with {ok_count}/{total_scenarios} successful scenarios "
+                    f"(DS={row.get('DS', '')}, RC={row.get('RC', '')}, "
+                    f"EPDMS={row.get('EPDMS_no_ep', '')})",
+                    flush=True,
+                )
             else:
                 row["status"] = "error"
                 row["error"] = f"Missing or unreadable summary CSV: {summary_csv}"
+                print(
+                    f"[multi-model] [{model_idx}/{total_models}] {spec['cli_model_type']} finished "
+                    f"without a readable batch summary. Expected: {summary_csv}",
+                    flush=True,
+                )
         except Exception as exc:
             row["status"] = "error"
             row["elapsed_sec"] = f"{time.time() - start_time:.1f}"
             row["error"] = str(exc)
+            print(
+                f"[multi-model] [{model_idx}/{total_models}] {spec['cli_model_type']} crashed: {exc}",
+                flush=True,
+            )
 
         comparison_rows.append(row)
 

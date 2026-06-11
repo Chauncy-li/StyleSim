@@ -200,6 +200,31 @@ class BatchEvaluator:
             subdir += f"_ta{self.temporal_alpha}_th{self.temporal_max_history}"
         return subdir
 
+    def _scenario_output_dir(self, scenario_name: str) -> Path:
+        """Return the unified evaluator output directory for one scenario."""
+        return self.output_root / self._get_output_subdir() / scenario_name
+
+    def _scenario_log_path(self, scenario_name: str) -> Path:
+        """Return the log file path for one scenario subprocess run."""
+        return self._scenario_output_dir(scenario_name) / "evaluation.log"
+
+    @staticmethod
+    def _format_metric(value: Any) -> str:
+        """Format a metric for concise terminal output."""
+        if value is None:
+            return "N/A"
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return "N/A"
+            try:
+                value = float(value)
+            except ValueError:
+                return value
+        if isinstance(value, (int, float)):
+            return f"{float(value):.4f}"
+        return str(value)
+
     def evaluate_scenario(self, scenario_path: Path) -> Dict[str, Any]:
         """
         Evaluate a single scenario.
@@ -211,6 +236,9 @@ class BatchEvaluator:
             Dictionary with evaluation results
         """
         scenario_name = scenario_path.name
+        scenario_output_dir = self._scenario_output_dir(scenario_name)
+        scenario_output_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self._scenario_log_path(scenario_name)
 
         # Build command
         cmd = [
@@ -320,20 +348,20 @@ class BatchEvaluator:
         # Run evaluation
         start_time = time.time()
         try:
-            result = subprocess.run(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd=_REPO_ROOT,  # Run from repository root so module imports resolve
-                timeout=3600  # 1 hour timeout per scenario
-            )
+            with open(log_path, "w", encoding="utf-8") as log_file:
+                result = subprocess.run(
+                    cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    cwd=_REPO_ROOT,  # Run from repository root so module imports resolve
+                    timeout=3600  # 1 hour timeout per scenario
+                )
 
             duration = time.time() - start_time
 
             if result.returncode == 0:
                 # Check if output exists (unified_evaluator nests under output_subdir/scenario_name/)
-                output_dir = self.output_root / self._get_output_subdir() / scenario_name
-                summary_csv = output_dir / "driving_score_summary.csv"
+                summary_csv = scenario_output_dir / "driving_score_summary.csv"
 
                 if summary_csv.exists():
                     # Read the AVERAGE row for in-memory tracking
@@ -351,6 +379,7 @@ class BatchEvaluator:
                         'duration': duration,
                         'exit_code': 0,
                         'scores': avg_scores,
+                        'log_path': str(log_path),
                         'timestamp': datetime.now().isoformat()
                     }
                 else:
@@ -359,6 +388,7 @@ class BatchEvaluator:
                         'duration': duration,
                         'exit_code': 0,
                         'error': 'driving_score_summary.csv not found',
+                        'log_path': str(log_path),
                         'timestamp': datetime.now().isoformat()
                     }
             else:
@@ -366,6 +396,7 @@ class BatchEvaluator:
                     'status': 'failed',
                     'duration': duration,
                     'exit_code': result.returncode,
+                    'log_path': str(log_path),
                     'timestamp': datetime.now().isoformat()
                 }
 
@@ -375,6 +406,7 @@ class BatchEvaluator:
                 'status': 'timeout',
                 'duration': duration,
                 'error': 'Evaluation timeout (1 hour)',
+                'log_path': str(log_path),
                 'timestamp': datetime.now().isoformat()
             }
         except Exception as e:
@@ -383,6 +415,7 @@ class BatchEvaluator:
                 'status': 'error',
                 'duration': duration,
                 'error': str(e),
+                'log_path': str(log_path),
                 'timestamp': datetime.now().isoformat()
             }
 
@@ -391,15 +424,46 @@ class BatchEvaluator:
         scenarios = self.get_scenarios()
 
         if not scenarios:
+            print(f"[batch:{self.model_type}] No scenarios to evaluate.")
             return
 
+        print(
+            f"[batch:{self.model_type}] Starting evaluation on {len(scenarios)} scenarios "
+            f"(traffic={self.traffic_mode}, controller={self.controller_type}, "
+            f"replan_rate={self.replan_rate}, eval_mode={self.eval_mode})"
+        )
+        print(f"[batch:{self.model_type}] Output root: {self.output_root}")
+
         # Sequential evaluation
-        for scenario_path in tqdm(scenarios, desc="Evaluating scenarios", disable=True):
+        total = len(scenarios)
+        for idx, scenario_path in enumerate(scenarios, start=1):
             scenario_name = scenario_path.name
+            print(f"[batch:{self.model_type}] [{idx}/{total}] {scenario_name} ...", flush=True)
 
             # Evaluate scenario
             result = self.evaluate_scenario(scenario_path)
             self.results['scenarios'][scenario_name] = result
+
+            status = result.get('status', 'unknown')
+            duration = self._format_metric(result.get('duration'))
+            if status == 'success':
+                scores = result.get('scores', {})
+                ds = self._format_metric(scores.get('DS'))
+                rc = self._format_metric(scores.get('RC'))
+                epdms = self._format_metric(scores.get('EPDMS_no_ep'))
+                print(
+                    f"[batch:{self.model_type}] [{idx}/{total}] {scenario_name} -> success "
+                    f"(DS={ds}, RC={rc}, EPDMS={epdms}, {duration}s)",
+                    flush=True,
+                )
+            else:
+                detail = result.get('error') or f"exit_code={result.get('exit_code', 'N/A')}"
+                log_path = result.get('log_path', 'N/A')
+                print(
+                    f"[batch:{self.model_type}] [{idx}/{total}] {scenario_name} -> {status} "
+                    f"({duration}s). detail: {detail}. log: {log_path}",
+                    flush=True,
+                )
 
         # Final summary
         # self.print_summary()
