@@ -1,7 +1,10 @@
 """
 Model configuration file - maps each adapter to its checkpoint path.
 
-Checkpoint Base Path: ckpts/BridgeSim (relative to repo root)
+Checkpoint Base Path:
+- Prefer repo_root/ckpts when checkpoints are downloaded directly there
+- Fall back to repo_root/ckpts/BridgeSim for older layouts
+
 Config Base Path: bridgesim/modelzoo/bench2drive (relative to repo root)
 
 Directory Structure:
@@ -15,8 +18,26 @@ from pathlib import Path
 # Base paths (relative to this file's directory)
 _THIS_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _THIS_DIR.parent.parent.parent  # bridgesim/evaluation/models -> repo root
-CKPT_BASE = str((_REPO_ROOT / "ckpts/BridgeSim").resolve())
+
+
+def _resolve_ckpt_base() -> Path:
+    """Support both `ckpts/` and legacy `ckpts/BridgeSim/` layouts."""
+    direct_root = (_REPO_ROOT / "ckpts").resolve()
+    legacy_root = (_REPO_ROOT / "ckpts" / "BridgeSim").resolve()
+
+    if (direct_root / "bench2drive").exists() or (direct_root / "navsimv2").exists():
+        return direct_root
+    if (legacy_root / "bench2drive").exists() or (legacy_root / "navsimv2").exists():
+        return legacy_root
+    return direct_root
+
+
+CKPT_BASE = str(_resolve_ckpt_base())
 _MODELZOO_BENCH2DRIVE = _THIS_DIR.parent.parent / "modelzoo" / "bench2drive"
+
+MODEL_ALIASES = {
+    "egomlp": "ego_mlp",
+}
 
 # Model checkpoint configurations
 # Models trained on Bench2Drive (bench2drive directory)
@@ -28,7 +49,7 @@ BENCH2DRIVE_MODELS = {
     },
     "vad": {
         "checkpoint": os.path.join(CKPT_BASE, "bench2drive/VAD/vad_b2d_base.pth"),
-        "config": str(_MODELZOO_BENCH2DRIVE / "adzoo/vad/configs/VAD_base_e2e_b2d.py"),
+        "config": str(_MODELZOO_BENCH2DRIVE / "adzoo/vad/configs/VAD/VAD_base_e2e_b2d.py"),
         "description": "VAD base model trained on Bench2Drive",
     },
     "tcp": {
@@ -101,6 +122,11 @@ COMMAAI_MODELS = {
 MODEL_CONFIGS = {**BENCH2DRIVE_MODELS, **NAVSIMV2_MODELS, **COMMAAI_MODELS}
 
 
+def normalize_model_type(model_type: str) -> str:
+    """Map common aliases to canonical model names used in MODEL_CONFIGS."""
+    return MODEL_ALIASES.get(model_type.lower(), model_type.lower())
+
+
 def get_checkpoint_path(model_type: str) -> str:
     """
     Get the checkpoint path for a given model type.
@@ -114,7 +140,7 @@ def get_checkpoint_path(model_type: str) -> str:
     Raises:
         ValueError: If model type is not recognized
     """
-    model_type = model_type.lower()
+    model_type = normalize_model_type(model_type)
     if model_type not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model type: {model_type}. Available: {list(MODEL_CONFIGS.keys())}")
     return MODEL_CONFIGS[model_type]["checkpoint"]
@@ -133,7 +159,7 @@ def get_config_path(model_type: str) -> str:
     Raises:
         ValueError: If model type is not recognized
     """
-    model_type = model_type.lower()
+    model_type = normalize_model_type(model_type)
     if model_type not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model type: {model_type}. Available: {list(MODEL_CONFIGS.keys())}")
     return MODEL_CONFIGS[model_type]["config"]
@@ -152,7 +178,7 @@ def get_model_info(model_type: str) -> dict:
     Raises:
         ValueError: If model type is not recognized
     """
-    model_type = model_type.lower()
+    model_type = normalize_model_type(model_type)
     if model_type not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model type: {model_type}. Available: {list(MODEL_CONFIGS.keys())}")
     return MODEL_CONFIGS[model_type]
@@ -160,12 +186,12 @@ def get_model_info(model_type: str) -> dict:
 
 def is_bench2drive_model(model_type: str) -> bool:
     """Check if a model is trained on Bench2Drive."""
-    return model_type.lower() in BENCH2DRIVE_MODELS
+    return normalize_model_type(model_type) in BENCH2DRIVE_MODELS
 
 
 def is_navsimv2_model(model_type: str) -> bool:
     """Check if a model is trained on NavSim v2."""
-    return model_type.lower() in NAVSIMV2_MODELS
+    return normalize_model_type(model_type) in NAVSIMV2_MODELS
 
 
 def list_available_models() -> list:

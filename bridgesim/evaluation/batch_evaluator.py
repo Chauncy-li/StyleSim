@@ -21,6 +21,8 @@ from tqdm import tqdm
 import time
 import numpy as np
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
 
 class BatchEvaluator:
     """Batch evaluator for multiple scenarios."""
@@ -31,6 +33,8 @@ class BatchEvaluator:
                  scenario_root: str,
                  output_root: str,
                  config_path: str = None,
+                 planner_type: str = "only_traj",
+                 image_source: str = "metadrive",
                  plan_anchor_path: str = None,
                  traffic_mode: str = "log_replay",
                  max_workers: int = 1,
@@ -65,7 +69,12 @@ class BatchEvaluator:
                  trajectory_scorer: str = None,
                  num_groups: int = None,
                  num_proposals: int = None,
-                 v2_scorer_checkpoint: str = None):
+                 v2_scorer_checkpoint: str = None,
+                 num_cameras: int = 4,
+                 image_size: List[int] = None,
+                 num_poses: int = 8,
+                 use_lidar: bool = False,
+                 scenario_limit: int = None):
         """
         Initialize batch evaluator.
 
@@ -102,6 +111,8 @@ class BatchEvaluator:
         self.model_type = model_type
         self.config_path = config_path
         self.checkpoint_path = checkpoint_path
+        self.planner_type = planner_type
+        self.image_source = image_source
         self.plan_anchor_path = plan_anchor_path
         self.scenario_root = Path(scenario_root)
         self.output_root = Path(output_root)
@@ -139,6 +150,11 @@ class BatchEvaluator:
         self.num_groups = num_groups
         self.num_proposals = num_proposals
         self.v2_scorer_checkpoint = v2_scorer_checkpoint
+        self.num_cameras = num_cameras
+        self.image_size = image_size if image_size is not None else [512, 288]
+        self.num_poses = num_poses
+        self.use_lidar = use_lidar
+        self.scenario_limit = scenario_limit
 
         # Create output directories
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -161,6 +177,9 @@ class BatchEvaluator:
             ]
             if scenarios:
                 pass  # resume filter count print suppressed
+
+        if self.scenario_limit is not None:
+            scenarios = scenarios[:self.scenario_limit]
 
         return scenarios
 
@@ -196,7 +215,8 @@ class BatchEvaluator:
         # Build command
         cmd = [
             sys.executable,  # Use current Python interpreter
-            "unified_evaluator.py",
+            "-m",
+            "bridgesim.evaluation.unified_evaluator",
             "--model-type", self.model_type,
             "--checkpoint", self.checkpoint_path,
             "--scenario-path", str(scenario_path),
@@ -207,6 +227,18 @@ class BatchEvaluator:
         # Add config path if available (required for UniAD/VAD)
         if self.config_path:
             cmd.extend(["--config", self.config_path])
+
+        # Add model-specific flags
+        if self.model_type == "tcp":
+            cmd.extend(["--planner-type", self.planner_type])
+        elif self.model_type == "rap":
+            cmd.extend(["--image-source", self.image_source])
+        elif self.model_type == "drivor":
+            cmd.extend(["--num-cameras", str(self.num_cameras)])
+            cmd.extend(["--image-size", str(self.image_size[0]), str(self.image_size[1])])
+            cmd.extend(["--num-poses", str(self.num_poses)])
+            if self.use_lidar:
+                cmd.append("--use-lidar")
 
         # Add plan anchor path if available (for DiffusionDrive/V2)
         if self.plan_anchor_path:
@@ -292,7 +324,7 @@ class BatchEvaluator:
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                cwd=Path(__file__).parent,  # Run from evaluation directory
+                cwd=_REPO_ROOT,  # Run from repository root so module imports resolve
                 timeout=3600  # 1 hour timeout per scenario
             )
 
@@ -458,6 +490,14 @@ def main():
     parser.add_argument('--config', type=str, default=None,
                         help="Path to model config file (required for UniAD/VAD)")
 
+    parser.add_argument('--planner-type', type=str, default='only_traj',
+                        choices=['only_ctrl', 'only_traj', 'merge_ctrl_traj'],
+                        help="TCP planner type (only used for TCP model)")
+
+    parser.add_argument('--image-source', type=str, default='metadrive',
+                        choices=['rasterized', 'metadrive', 'rasterized_3d'],
+                        help="RAP image source (only used for RAP model)")
+
     parser.add_argument('--plan-anchor-path', type=str, default=None,
                         help="Path to plan anchor file (for DiffusionDrive/V2 models)")
 
@@ -473,6 +513,10 @@ def main():
 
     parser.add_argument('--max-workers', type=int, default=1,
                         help="Number of parallel workers (1 = sequential)")
+
+    parser.add_argument('--scenario-limit', type=int, default=None,
+                        help="Optional limit on the number of scenarios to evaluate. "
+                             "Useful for smoke tests such as the first 10 sorted scenarios.")
 
     parser.add_argument('--resume', action='store_true',
                         help="Resume from previous run (skip completed scenarios)")
@@ -592,6 +636,19 @@ def main():
                         help="Path to DiffusionDrive v2 checkpoint for loading coarse scorer weights. "
                              "Required when using --trajectory-scorer learned with DiffusionDrive v1.")
 
+    parser.add_argument('--num-cameras', type=int, default=4, choices=[4, 8],
+                        help="Number of cameras for DrivoR (4 or 8)")
+
+    parser.add_argument('--image-size', type=int, nargs=2, default=[512, 288],
+                        metavar=('WIDTH', 'HEIGHT'),
+                        help="Image size for DrivoR (width height)")
+
+    parser.add_argument('--num-poses', type=int, default=8,
+                        help="Number of trajectory poses for DrivoR")
+
+    parser.add_argument('--use-lidar', action='store_true',
+                        help="Use LiDAR input for DrivoR")
+
     args = parser.parse_args()
 
     # Create batch evaluator
@@ -601,6 +658,8 @@ def main():
         scenario_root=args.scenario_root,
         output_root=args.output_dir,
         config_path=args.config,
+        planner_type=args.planner_type,
+        image_source=args.image_source,
         plan_anchor_path=args.plan_anchor_path,
         traffic_mode=args.traffic_mode,
         max_workers=args.max_workers,
@@ -635,6 +694,11 @@ def main():
         num_groups=args.num_groups,
         num_proposals=args.num_proposals,
         v2_scorer_checkpoint=args.v2_scorer_checkpoint,
+        num_cameras=args.num_cameras,
+        image_size=args.image_size,
+        num_poses=args.num_poses,
+        use_lidar=args.use_lidar,
+        scenario_limit=args.scenario_limit,
     )
 
     # Run evaluation

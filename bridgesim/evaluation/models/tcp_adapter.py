@@ -4,7 +4,6 @@ Model adapter for TCP (Trajectory-guided Control Prediction).
 
 import torch
 import numpy as np
-from pathlib import Path
 from typing import Dict, Any
 from collections import OrderedDict
 from torchvision import transforms as T
@@ -20,8 +19,7 @@ class TCPAdapter(BaseModelAdapter):
     """
     Adapter for TCP model.
 
-    TCP uses only the front camera (CAM_FRONT) and predicts waypoints + control signals.
-    Note: Original ResNet34 backbone expects 3-channel input (single RGB image).
+    TCP uses 3 stitched front cameras and predicts waypoints + control signals.
     """
 
     def __init__(self, checkpoint_path: str, planner_type: str = "only_traj", **kwargs):
@@ -73,38 +71,57 @@ class TCPAdapter(BaseModelAdapter):
             'CAM_FRONT_RIGHT': {'x': 0.27, 'y': 0.55, 'z': 1.60, 'yaw': 55.0, 'pitch': 0.0, 'roll': 0.0, 'fov': 70, 'width': 1600, 'height': 900},
         }
 
+    def _to_rgb(self, image: np.ndarray) -> np.ndarray:
+        """Convert BGR image from evaluator to RGB numpy array."""
+        return image[:, :, ::-1].copy()
+
+    def _get_camera_rgb(self, images: Dict[str, np.ndarray], camera_name: str, fallback: np.ndarray) -> np.ndarray:
+        """Fetch an RGB camera image, falling back to the front camera when needed."""
+        if camera_name not in images:
+            return fallback.copy()
+        return self._to_rgb(images[camera_name])
+
+    def _prepare_stitched_image(self, images: Dict[str, np.ndarray]) -> torch.Tensor:
+        """
+        Mirror the original TCP preprocessing used during training:
+        stitch front-left, cropped front, and front-right, then resize to 256x900.
+        """
+        front_rgb = self._to_rgb(images['CAM_FRONT'])
+        front_left_rgb = self._get_camera_rgb(images, 'CAM_FRONT_LEFT', front_rgb)
+        front_right_rgb = self._get_camera_rgb(images, 'CAM_FRONT_RIGHT', front_rgb)
+
+        front_crop = front_rgb[:, 200:1400, :]
+        front_left_crop = front_left_rgb[:, :1400, :]
+        front_right_crop = front_right_rgb[:, 200:, :]
+
+        stitched = np.concatenate((front_left_crop, front_crop, front_right_crop), axis=1)
+        stitched_tensor = torch.from_numpy(stitched).permute(2, 0, 1).float() / 255.0
+        stitched_tensor = torch.nn.functional.interpolate(
+            stitched_tensor.unsqueeze(0),
+            size=(256, 900),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
+        return self.img_normalize(stitched_tensor)
+
     def prepare_input(self,
                      images: Dict[str, np.ndarray],
                      ego_state: Dict[str, Any],
                      scenario_data: Dict[str, Any],
                      frame_id: int) -> Any:
         """Prepare input for TCP model."""
-        # Process images
-        # TCP uses only front camera (ResNet expects 3 channels)
-        img = images['CAM_FRONT']
-        # Convert BGR to RGB
-        img_rgb = img[:, :, ::-1].copy()
-        # Resize to 256x256
-        img_resized = torch.from_numpy(img_rgb).permute(2, 0, 1).float() / 255.0
-        img_resized = torch.nn.functional.interpolate(
-            img_resized.unsqueeze(0),
-            size=(256, 256),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(0)
-        # Normalize
-        img_normalized = self.img_normalize(img_resized)
-
-        # Add batch dimension: [1, 3, 256, 256]
-        img_tensor = img_normalized.unsqueeze(0).cuda()
+        # TCP was trained on a stitched 3-camera panorama rather than a single front image.
+        img_tensor = self._prepare_stitched_image(images).unsqueeze(0).cuda()
 
         # Compute target point in ego frame
         delta_world = ego_state['waypoint'] - ego_state['position'][:2]
-        cos_h = np.cos(-ego_state['heading'])
-        sin_h = np.sin(-ego_state['heading'])
-        target_ego_x = cos_h * delta_world[0] - sin_h * delta_world[1]
-        target_ego_y = sin_h * delta_world[0] + cos_h * delta_world[1]
-        target_point = torch.FloatTensor([[target_ego_x, target_ego_y]]).cuda()
+        ego_theta = ego_state['heading'] - np.pi / 2
+        rotation = np.array([
+            [np.cos(ego_theta), np.sin(ego_theta)],
+            [-np.sin(ego_theta), np.cos(ego_theta)],
+        ], dtype=np.float32)
+        target_ego = rotation.dot(delta_world.astype(np.float32))
+        target_point = torch.from_numpy(target_ego[:2]).unsqueeze(0).float().cuda()
 
         # Speed normalized by 12
         speed = np.linalg.norm(ego_state['velocity'])

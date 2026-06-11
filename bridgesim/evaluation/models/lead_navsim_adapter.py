@@ -6,7 +6,7 @@ LEAD NavSim uses 4 cameras with 1920x270 resolution and 4 discrete commands.
 """
 
 import sys
-import json
+import types
 import torch
 import numpy as np
 import cv2
@@ -39,6 +39,66 @@ class LEADNavsimAdapter(BaseModelAdapter):
         self.image_width = 1920
         self.image_height = 270
 
+    def _load_ltfv6_module(self, checkpoint_dir: Path):
+        """
+        Load the bundled ``ltfv6.py`` in a Python-3.9-safe way.
+
+        The checkpoint file uses PEP 604 unions inside jaxtyping annotations, which
+        are evaluated eagerly on Python 3.9. Prepending ``from __future__ import
+        annotations`` keeps those annotations lazy without modifying the checkpoint
+        bundle itself.
+        """
+        module_path = checkpoint_dir / "ltfv6.py"
+        module_name = f"_bridgesim_ltfv6_{abs(hash(str(module_path)))}"
+
+        if module_name in sys.modules:
+            return sys.modules[module_name]
+
+        source = module_path.read_text(encoding="utf-8")
+        if "from __future__ import annotations" not in source:
+            source = "from __future__ import annotations\n" + source
+
+        # Disable checkpoint-bundled runtime type enforcement during import.
+        # These decorators are helpful for training/dev, but on Python 3.9 they
+        # eagerly evaluate jaxtyping unions that this evaluator does not need.
+        source = source.replace(
+            "import jaxtyping as jt",
+            "import jaxtyping as jt\n"
+            "def _bridgesim_noop_jaxtyped(obj=None, *args, **kwargs):\n"
+            "    if callable(obj):\n"
+            "        return obj\n"
+            "    def decorator(fn):\n"
+            "        return fn\n"
+            "    return decorator\n"
+            "jt.jaxtyped = _bridgesim_noop_jaxtyped",
+        )
+        source = source.replace(
+            "from beartype import beartype",
+            "def beartype(obj=None, *args, **kwargs):\n"
+            "    if callable(obj):\n"
+            "        return obj\n"
+            "    def decorator(fn):\n"
+            "        return fn\n"
+            "    return decorator",
+        )
+        source = source.replace(
+            'self.image_encoder = timm.create_model(config.image_architecture, pretrained=True, features_only=True)',
+            'self.image_encoder = timm.create_model(config.image_architecture, pretrained=False, features_only=True)',
+        )
+        source = source.replace('raise Exception(f"Unknown GPU name: {name}")', 'return ""')
+
+        module = types.ModuleType(module_name)
+        module.__file__ = str(module_path)
+        module.__package__ = ""
+
+        sys.modules[module_name] = module
+        try:
+            exec(compile(source, str(module_path), "exec"), module.__dict__)
+        except Exception:
+            sys.modules.pop(module_name, None)
+            raise
+        return module
+
     def load_model(self):
         """Load LEAD NavSim model from checkpoint."""
         print("Loading LEAD NavSim (LTFv6) model...")
@@ -46,11 +106,9 @@ class LEADNavsimAdapter(BaseModelAdapter):
         # Get the directory containing the checkpoint (should have ltfv6.py and config.json)
         checkpoint_dir = Path(self.checkpoint_path).parent
 
-        # Add checkpoint directory to path to import ltfv6
-        sys.path.insert(0, str(checkpoint_dir))
-
-        # Import the model loader from the bundled ltfv6.py
-        from ltfv6 import load_tf
+        # Load the bundled ltfv6.py while preserving Python 3.9 compatibility.
+        ltfv6_module = self._load_ltfv6_module(checkpoint_dir)
+        load_tf = ltfv6_module.load_tf
 
         # Load model using the bundled loader
         self.model = load_tf(self.checkpoint_path, torch.device(self.device))
